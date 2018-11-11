@@ -15,7 +15,10 @@ import (
 	"path"
 )
 
-var socketDirectory = "/var/run/wireguard"
+var socketDirectory, ok = os.LookupEnv("WG_SOCKET_DIR")
+if !ok {
+	socketDirectory = "/var/run/wireguard"
+}
 
 const (
 	ipcErrorIO        = -int64(unix.EIO)
