@@ -15,11 +15,6 @@ import (
 	"path"
 )
 
-var socketDirectory, ok = os.LookupEnv("WG_SOCKET_DIR")
-if !ok {
-	socketDirectory = "/var/run/wireguard"
-}
-
 const (
 	ipcErrorIO        = -int64(unix.EIO)
 	ipcErrorProtocol  = -int64(unix.EPROTO)
@@ -66,6 +61,11 @@ func (l *UAPIListener) Addr() net.Addr {
 }
 
 func UAPIListen(name string, file *os.File) (net.Listener, error) {
+
+	socketDirectory := os.Getenv("WG_SOCKET_DIR")
+	if socketDirectory == "" {
+		socketDirectory = "/var/run/wireguard"
+	}
 
 	// wrap file in listener
 
@@ -147,6 +147,11 @@ func UAPIListen(name string, file *os.File) (net.Listener, error) {
 }
 
 func UAPIOpen(name string) (*os.File, error) {
+
+	socketDirectory := os.Getenv("WG_SOCKET_DIR")
+	if socketDirectory == "" {
+		socketDirectory = "/var/run/wireguard"
+	}
 
 	// check if path exist
 
