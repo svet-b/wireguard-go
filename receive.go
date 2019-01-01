@@ -97,7 +97,7 @@ func (device *Device) RoutineReceiveIncoming(IP int, bind Bind) {
 		device.net.stopping.Done()
 	}()
 
-	logDebug.Println("Routine: receive incoming IPv" + strconv.Itoa(IP) + " - starting")
+	logDebug.Println("Routine: receive incoming IPv" + strconv.Itoa(IP) + " - started")
 	device.net.starting.Done()
 
 	// receive datagrams until conn is closed
@@ -351,7 +351,10 @@ func (device *Device) RoutineHandshake() {
 			// consume reply
 
 			if peer := entry.peer; peer.isRunning.Get() {
-				peer.cookieGenerator.ConsumeReply(&reply)
+				logDebug.Println("Receiving cookie response from ", elem.endpoint.DstToString())
+				if !peer.cookieGenerator.ConsumeReply(&reply) {
+					logDebug.Println("Could not decrypt invalid cookie response")
+				}
 			}
 
 			continue
