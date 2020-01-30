@@ -1,6 +1,6 @@
-/* SPDX-License-Identifier: GPL-2.0
+/* SPDX-License-Identifier: MIT
  *
- * Copyright (C) 2017-2018 WireGuard LLC. All Rights Reserved.
+ * Copyright (C) 2017-2019 WireGuard LLC. All Rights Reserved.
  */
 
 package ratelimiter
@@ -36,7 +36,7 @@ func TestRatelimiter(t *testing.T) {
 	for i := 0; i < packetsBurstable; i++ {
 		Add(RatelimiterResult{
 			allowed: true,
-			text:    "inital burst",
+			text:    "initial burst",
 		})
 	}
 

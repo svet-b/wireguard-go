@@ -1,21 +1,20 @@
-/* SPDX-License-Identifier: GPL-2.0
+/* SPDX-License-Identifier: MIT
  *
- * Copyright (C) 2017-2018 WireGuard LLC. All Rights Reserved.
+ * Copyright (C) 2017-2019 WireGuard LLC. All Rights Reserved.
  */
 
 package tun
 
 import (
-	"errors"
 	"fmt"
-	"git.zx2c4.com/wireguard-go/rwcancel"
-	"golang.org/x/net/ipv6"
-	"golang.org/x/sys/unix"
 	"io/ioutil"
 	"net"
 	"os"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/net/ipv6"
+	"golang.org/x/sys/unix"
 )
 
 // Structure for iface mtu get/set ioctls
@@ -27,16 +26,15 @@ type ifreq_mtu struct {
 
 const _TUNSIFMODE = 0x8004745d
 
-type nativeTun struct {
+type NativeTun struct {
 	name        string
 	tunFile     *os.File
-	rwcancel    *rwcancel.RWCancel
-	events      chan TUNEvent
+	events      chan Event
 	errors      chan error
 	routeSocket int
 }
 
-func (tun *nativeTun) routineRouteListener(tunIfindex int) {
+func (tun *NativeTun) routineRouteListener(tunIfindex int) {
 	var (
 		statusUp  bool
 		statusMTU int
@@ -44,13 +42,41 @@ func (tun *nativeTun) routineRouteListener(tunIfindex int) {
 
 	defer close(tun.events)
 
+	check := func() bool {
+		iface, err := net.InterfaceByIndex(tunIfindex)
+		if err != nil {
+			tun.errors <- err
+			return true
+		}
+
+		// Up / Down event
+		up := (iface.Flags & net.FlagUp) != 0
+		if up != statusUp && up {
+			tun.events <- EventUp
+		}
+		if up != statusUp && !up {
+			tun.events <- EventDown
+		}
+		statusUp = up
+
+		// MTU changes
+		if iface.MTU != statusMTU {
+			tun.events <- EventMTUUpdate
+		}
+		statusMTU = iface.MTU
+		return false
+	}
+
+	if check() {
+		return
+	}
+
 	data := make([]byte, os.Getpagesize())
 	for {
-	retry:
 		n, err := unix.Read(tun.routeSocket, data)
 		if err != nil {
 			if errno, ok := err.(syscall.Errno); ok && errno == syscall.EINTR {
-				goto retry
+				continue
 			}
 			tun.errors <- err
 			return
@@ -67,28 +93,9 @@ func (tun *nativeTun) routineRouteListener(tunIfindex int) {
 		if ifindex != tunIfindex {
 			continue
 		}
-
-		iface, err := net.InterfaceByIndex(ifindex)
-		if err != nil {
-			tun.errors <- err
+		if check() {
 			return
 		}
-
-		// Up / Down event
-		up := (iface.Flags & net.FlagUp) != 0
-		if up != statusUp && up {
-			tun.events <- TUNEventUp
-		}
-		if up != statusUp && !up {
-			tun.events <- TUNEventDown
-		}
-		statusUp = up
-
-		// MTU changes
-		if iface.MTU != statusMTU {
-			tun.events <- TUNEventMTUUpdate
-		}
-		statusMTU = iface.MTU
 	}
 }
 
@@ -102,7 +109,7 @@ func errorIsEBUSY(err error) bool {
 	return false
 }
 
-func CreateTUN(name string, mtu int) (TUNDevice, error) {
+func CreateTUN(name string, mtu int) (Device, error) {
 	ifIndex := -1
 	if name != "tun" {
 		_, err := fmt.Sscanf(name, "tun%d", &ifIndex)
@@ -134,18 +141,17 @@ func CreateTUN(name string, mtu int) (TUNDevice, error) {
 	if err == nil && name == "tun" {
 		fname := os.Getenv("WG_TUN_NAME_FILE")
 		if fname != "" {
-			ioutil.WriteFile(fname, []byte(tun.(*nativeTun).name+"\n"), 0400)
+			ioutil.WriteFile(fname, []byte(tun.(*NativeTun).name+"\n"), 0400)
 		}
 	}
 
 	return tun, err
 }
 
-func CreateTUNFromFile(file *os.File, mtu int) (TUNDevice, error) {
-
-	tun := &nativeTun{
+func CreateTUNFromFile(file *os.File, mtu int) (Device, error) {
+	tun := &NativeTun{
 		tunFile: file,
-		events:  make(chan TUNEvent, 10),
+		events:  make(chan Event, 10),
 		errors:  make(chan error, 1),
 	}
 
@@ -167,12 +173,6 @@ func CreateTUNFromFile(file *os.File, mtu int) (TUNDevice, error) {
 		return nil, err
 	}
 
-	tun.rwcancel, err = rwcancel.NewRWCancel(int(file.Fd()))
-	if err != nil {
-		tun.tunFile.Close()
-		return nil, err
-	}
-
 	tun.routeSocket, err = unix.Socket(unix.AF_ROUTE, unix.SOCK_RAW, unix.AF_UNSPEC)
 	if err != nil {
 		tun.tunFile.Close()
@@ -181,16 +181,19 @@ func CreateTUNFromFile(file *os.File, mtu int) (TUNDevice, error) {
 
 	go tun.routineRouteListener(tunIfindex)
 
-	err = tun.setMTU(mtu)
-	if err != nil {
-		tun.Close()
-		return nil, err
+	currentMTU, err := tun.MTU()
+	if err != nil || currentMTU != mtu {
+		err = tun.setMTU(mtu)
+		if err != nil {
+			tun.Close()
+			return nil, err
+		}
 	}
 
 	return tun, nil
 }
 
-func (tun *nativeTun) Name() (string, error) {
+func (tun *NativeTun) Name() (string, error) {
 	gostat, err := tun.tunFile.Stat()
 	if err != nil {
 		tun.name = ""
@@ -201,15 +204,15 @@ func (tun *nativeTun) Name() (string, error) {
 	return tun.name, nil
 }
 
-func (tun *nativeTun) File() *os.File {
+func (tun *NativeTun) File() *os.File {
 	return tun.tunFile
 }
 
-func (tun *nativeTun) Events() chan TUNEvent {
+func (tun *NativeTun) Events() chan Event {
 	return tun.events
 }
 
-func (tun *nativeTun) doRead(buff []byte, offset int) (int, error) {
+func (tun *NativeTun) Read(buff []byte, offset int) (int, error) {
 	select {
 	case err := <-tun.errors:
 		return 0, err
@@ -223,19 +226,7 @@ func (tun *nativeTun) doRead(buff []byte, offset int) (int, error) {
 	}
 }
 
-func (tun *nativeTun) Read(buff []byte, offset int) (int, error) {
-	for {
-		n, err := tun.doRead(buff, offset)
-		if err == nil || !rwcancel.RetryAfterError(err) {
-			return n, err
-		}
-		if !tun.rwcancel.ReadyRead() {
-			return 0, errors.New("tun device closed")
-		}
-	}
-}
-
-func (tun *nativeTun) Write(buff []byte, offset int) (int, error) {
+func (tun *NativeTun) Write(buff []byte, offset int) (int, error) {
 
 	// reserve space for header
 
@@ -258,13 +249,17 @@ func (tun *nativeTun) Write(buff []byte, offset int) (int, error) {
 	return tun.tunFile.Write(buff)
 }
 
-func (tun *nativeTun) Close() error {
-	var err3 error
-	err1 := tun.rwcancel.Cancel()
-	err2 := tun.tunFile.Close()
+func (tun *NativeTun) Flush() error {
+	// TODO: can flushing be implemented by buffering and using sendmmsg?
+	return nil
+}
+
+func (tun *NativeTun) Close() error {
+	var err2 error
+	err1 := tun.tunFile.Close()
 	if tun.routeSocket != -1 {
 		unix.Shutdown(tun.routeSocket, unix.SHUT_RDWR)
-		err3 = unix.Close(tun.routeSocket)
+		err2 = unix.Close(tun.routeSocket)
 		tun.routeSocket = -1
 	} else if tun.events != nil {
 		close(tun.events)
@@ -272,13 +267,10 @@ func (tun *nativeTun) Close() error {
 	if err1 != nil {
 		return err1
 	}
-	if err2 != nil {
-		return err2
-	}
-	return err3
+	return err2
 }
 
-func (tun *nativeTun) setMTU(n int) error {
+func (tun *NativeTun) setMTU(n int) error {
 	// open datagram socket
 
 	var fd int
@@ -315,7 +307,7 @@ func (tun *nativeTun) setMTU(n int) error {
 	return nil
 }
 
-func (tun *nativeTun) MTU() (int, error) {
+func (tun *NativeTun) MTU() (int, error) {
 	// open datagram socket
 
 	fd, err := unix.Socket(

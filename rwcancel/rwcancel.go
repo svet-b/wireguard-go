@@ -1,15 +1,16 @@
-/* SPDX-License-Identifier: GPL-2.0
+/* SPDX-License-Identifier: MIT
  *
- * Copyright (C) 2017-2018 WireGuard LLC. All Rights Reserved.
+ * Copyright (C) 2017-2019 WireGuard LLC. All Rights Reserved.
  */
 
 package rwcancel
 
 import (
 	"errors"
-	"golang.org/x/sys/unix"
 	"os"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 func max(a, b int) int {
@@ -59,7 +60,13 @@ func (rw *RWCancel) ReadyRead() bool {
 	fdset := fdSet{}
 	fdset.set(rw.fd)
 	fdset.set(closeFd)
-	err := unixSelect(max(rw.fd, closeFd)+1, &fdset.fdset, nil, nil, nil)
+	var err error
+	for {
+		err = unixSelect(max(rw.fd, closeFd)+1, &fdset.FdSet, nil, nil, nil)
+		if err == nil || !RetryAfterError(err) {
+			break
+		}
+	}
 	if err != nil {
 		return false
 	}
@@ -74,7 +81,13 @@ func (rw *RWCancel) ReadyWrite() bool {
 	fdset := fdSet{}
 	fdset.set(rw.fd)
 	fdset.set(closeFd)
-	err := unixSelect(max(rw.fd, closeFd)+1, nil, &fdset.fdset, nil, nil)
+	var err error
+	for {
+		err = unixSelect(max(rw.fd, closeFd)+1, nil, &fdset.FdSet, nil, nil)
+		if err == nil || !RetryAfterError(err) {
+			break
+		}
+	}
 	if err != nil {
 		return false
 	}

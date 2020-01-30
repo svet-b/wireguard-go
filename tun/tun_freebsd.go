@@ -1,6 +1,6 @@
-/* SPDX-License-Identifier: GPL-2.0
+/* SPDX-License-Identifier: MIT
  *
- * Copyright (C) 2017-2018 WireGuard LLC. All Rights Reserved.
+ * Copyright (C) 2017-2019 WireGuard LLC. All Rights Reserved.
  */
 
 package tun
@@ -9,20 +9,30 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"git.zx2c4.com/wireguard-go/rwcancel"
-	"golang.org/x/net/ipv6"
-	"golang.org/x/sys/unix"
 	"net"
 	"os"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/net/ipv6"
+	"golang.org/x/sys/unix"
 )
 
 // _TUNSIFHEAD, value derived from sys/net/{if_tun,ioccom}.h
 // const _TUNSIFHEAD = ((0x80000000) | (((4) & ((1 << 13) - 1) ) << 16) | (uint32(byte('t')) << 8) | (96))
-const _TUNSIFHEAD = 0x80047460
-const _TUNSIFMODE = 0x8004745e
-const _TUNSIFPID = 0x2000745f
+const (
+	_TUNSIFHEAD = 0x80047460
+	_TUNSIFMODE = 0x8004745e
+	_TUNSIFPID  = 0x2000745f
+)
+
+// TODO: move into x/sys/unix
+const (
+	SIOCGIFINFO_IN6        = 0xc048696c
+	SIOCSIFINFO_IN6        = 0xc048696d
+	ND6_IFF_AUTO_LINKLOCAL = 0x20
+	ND6_IFF_NO_DAD         = 0x100
+)
 
 // Iface status string max len
 const _IFSTATMAX = 800
@@ -33,7 +43,7 @@ const SIZEOF_UINTPTR = 4 << (^uintptr(0) >> 32 & 1)
 type ifreq_ptr struct {
 	Name [unix.IFNAMSIZ]byte
 	Data uintptr
-	Pad0 [24 - SIZEOF_UINTPTR]byte
+	Pad0 [16 - SIZEOF_UINTPTR]byte
 }
 
 // Structure for iface mtu get/set ioctls
@@ -49,17 +59,32 @@ type ifstat struct {
 	Ascii   [_IFSTATMAX]byte
 }
 
-type nativeTun struct {
+// Structures for nd6 flag manipulation
+type in6_ndireq struct {
+	Name          [unix.IFNAMSIZ]byte
+	Linkmtu       uint32
+	Maxmtu        uint32
+	Basereachable uint32
+	Reachable     uint32
+	Retrans       uint32
+	Flags         uint32
+	Recalctm      int
+	Chlim         uint8
+	Initialized   uint8
+	Randomseed0   [8]byte
+	Randomseed1   [8]byte
+	Randomid      [8]byte
+}
+
+type NativeTun struct {
 	name        string
 	tunFile     *os.File
-	fd          uintptr
-	rwcancel    *rwcancel.RWCancel
-	events      chan TUNEvent
+	events      chan Event
 	errors      chan error
 	routeSocket int
 }
 
-func (tun *nativeTun) routineRouteListener(tunIfindex int) {
+func (tun *NativeTun) routineRouteListener(tunIfindex int) {
 	var (
 		statusUp  bool
 		statusMTU int
@@ -100,16 +125,16 @@ func (tun *nativeTun) routineRouteListener(tunIfindex int) {
 		// Up / Down event
 		up := (iface.Flags & net.FlagUp) != 0
 		if up != statusUp && up {
-			tun.events <- TUNEventUp
+			tun.events <- EventUp
 		}
 		if up != statusUp && !up {
-			tun.events <- TUNEventDown
+			tun.events <- EventDown
 		}
 		statusUp = up
 
 		// MTU changes
 		if iface.MTU != statusMTU {
-			tun.events <- TUNEventMTUUpdate
+			tun.events <- EventMTUUpdate
 		}
 		statusMTU = iface.MTU
 	}
@@ -194,22 +219,17 @@ func tunName(fd uintptr) (string, error) {
 
 // Destroy a named system interface
 func tunDestroy(name string) error {
-	// open control socket
+	// Open control socket.
 	var fd int
-
 	fd, err := unix.Socket(
 		unix.AF_INET,
 		unix.SOCK_DGRAM,
 		0,
 	)
-
 	if err != nil {
 		return err
 	}
-
 	defer unix.Close(fd)
-
-	// do ioctl call
 
 	var ifr [32]byte
 	copy(ifr[:], name)
@@ -219,7 +239,6 @@ func tunDestroy(name string) error {
 		uintptr(unix.SIOCIFDESTROY),
 		uintptr(unsafe.Pointer(&ifr[0])),
 	)
-
 	if errno != 0 {
 		return fmt.Errorf("failed to destroy interface %s: %s", name, errno.Error())
 	}
@@ -227,7 +246,7 @@ func tunDestroy(name string) error {
 	return nil
 }
 
-func CreateTUN(name string, mtu int) (TUNDevice, error) {
+func CreateTUN(name string, mtu int) (Device, error) {
 	if len(name) > unix.IFNAMSIZ-1 {
 		return nil, errors.New("interface name too long")
 	}
@@ -239,12 +258,15 @@ func CreateTUN(name string, mtu int) (TUNDevice, error) {
 	}
 
 	tunFile, err := os.OpenFile("/dev/tun", unix.O_RDWR, 0)
-
 	if err != nil {
 		return nil, err
 	}
-	tunfd := tunFile.Fd()
-	assignedName, err := tunName(tunfd)
+
+	tun := NativeTun{tunFile: tunFile}
+	var assignedName string
+	tun.operateOnFd(func(fd uintptr) {
+		assignedName, err = tunName(fd)
+	})
 	if err != nil {
 		tunFile.Close()
 		return nil, err
@@ -252,41 +274,82 @@ func CreateTUN(name string, mtu int) (TUNDevice, error) {
 
 	// Enable ifhead mode, otherwise tun will complain if it gets a non-AF_INET packet
 	ifheadmode := 1
-	_, _, errno := unix.Syscall(
-		unix.SYS_IOCTL,
-		uintptr(tunfd),
-		uintptr(_TUNSIFHEAD),
-		uintptr(unsafe.Pointer(&ifheadmode)),
-	)
+	var errno syscall.Errno
+	tun.operateOnFd(func(fd uintptr) {
+		_, _, errno = unix.Syscall(
+			unix.SYS_IOCTL,
+			fd,
+			uintptr(_TUNSIFHEAD),
+			uintptr(unsafe.Pointer(&ifheadmode)),
+		)
+	})
 
 	if errno != 0 {
-		return nil, fmt.Errorf("error %s", errno.Error())
+		tunFile.Close()
+		tunDestroy(assignedName)
+		return nil, fmt.Errorf("Unable to put into IFHEAD mode: %v", errno)
 	}
 
-	// Rename tun interface
-
-	// Open control socket
+	// Open control sockets
 	confd, err := unix.Socket(
 		unix.AF_INET,
 		unix.SOCK_DGRAM,
 		0,
 	)
-
 	if err != nil {
+		tunFile.Close()
+		tunDestroy(assignedName)
 		return nil, err
 	}
-
 	defer unix.Close(confd)
+	confd6, err := unix.Socket(
+		unix.AF_INET6,
+		unix.SOCK_DGRAM,
+		0,
+	)
+	if err != nil {
+		tunFile.Close()
+		tunDestroy(assignedName)
+		return nil, err
+	}
+	defer unix.Close(confd6)
 
-	// set up struct for iface rename
+	// Disable link-local v6, not just because WireGuard doesn't do that anyway, but
+	// also because there are serious races with attaching and detaching LLv6 addresses
+	// in relation to interface lifetime within the FreeBSD kernel.
+	var ndireq in6_ndireq
+	copy(ndireq.Name[:], assignedName)
+	_, _, errno = unix.Syscall(
+		unix.SYS_IOCTL,
+		uintptr(confd6),
+		uintptr(SIOCGIFINFO_IN6),
+		uintptr(unsafe.Pointer(&ndireq)),
+	)
+	if errno != 0 {
+		tunFile.Close()
+		tunDestroy(assignedName)
+		return nil, fmt.Errorf("Unable to get nd6 flags for %s: %v", assignedName, errno)
+	}
+	ndireq.Flags = ndireq.Flags &^ ND6_IFF_AUTO_LINKLOCAL
+	ndireq.Flags = ndireq.Flags | ND6_IFF_NO_DAD
+	_, _, errno = unix.Syscall(
+		unix.SYS_IOCTL,
+		uintptr(confd6),
+		uintptr(SIOCSIFINFO_IN6),
+		uintptr(unsafe.Pointer(&ndireq)),
+	)
+	if errno != 0 {
+		tunFile.Close()
+		tunDestroy(assignedName)
+		return nil, fmt.Errorf("Unable to set nd6 flags for %s: %v", assignedName, errno)
+	}
+
+	// Rename the interface
 	var newnp [unix.IFNAMSIZ]byte
 	copy(newnp[:], name)
-
 	var ifr ifreq_ptr
 	copy(ifr.Name[:], assignedName)
 	ifr.Data = uintptr(unsafe.Pointer(&newnp[0]))
-
-	//do actual ioctl to rename iface
 	_, _, errno = unix.Syscall(
 		unix.SYS_IOCTL,
 		uintptr(confd),
@@ -295,19 +358,18 @@ func CreateTUN(name string, mtu int) (TUNDevice, error) {
 	)
 	if errno != 0 {
 		tunFile.Close()
-		tunDestroy(name)
-		return nil, fmt.Errorf("failed to rename %s to %s: %s", assignedName, name, errno.Error())
+		tunDestroy(assignedName)
+		return nil, fmt.Errorf("Failed to rename %s to %s: %v", assignedName, name, errno)
 	}
 
 	return CreateTUNFromFile(tunFile, mtu)
 }
 
-func CreateTUNFromFile(file *os.File, mtu int) (TUNDevice, error) {
+func CreateTUNFromFile(file *os.File, mtu int) (Device, error) {
 
-	tun := &nativeTun{
+	tun := &NativeTun{
 		tunFile: file,
-		fd:      file.Fd(),
-		events:  make(chan TUNEvent, 10),
+		events:  make(chan Event, 10),
 		errors:  make(chan error, 1),
 	}
 
@@ -324,12 +386,6 @@ func CreateTUNFromFile(file *os.File, mtu int) (TUNDevice, error) {
 		}
 		return iface.Index, nil
 	}()
-	if err != nil {
-		tun.tunFile.Close()
-		return nil, err
-	}
-
-	tun.rwcancel, err = rwcancel.NewRWCancel(int(tun.fd))
 	if err != nil {
 		tun.tunFile.Close()
 		return nil, err
@@ -352,8 +408,12 @@ func CreateTUNFromFile(file *os.File, mtu int) (TUNDevice, error) {
 	return tun, nil
 }
 
-func (tun *nativeTun) Name() (string, error) {
-	name, err := tunName(tun.fd)
+func (tun *NativeTun) Name() (string, error) {
+	var name string
+	var err error
+	tun.operateOnFd(func(fd uintptr) {
+		name, err = tunName(fd)
+	})
 	if err != nil {
 		return "", err
 	}
@@ -361,15 +421,15 @@ func (tun *nativeTun) Name() (string, error) {
 	return name, nil
 }
 
-func (tun *nativeTun) File() *os.File {
+func (tun *NativeTun) File() *os.File {
 	return tun.tunFile
 }
 
-func (tun *nativeTun) Events() chan TUNEvent {
+func (tun *NativeTun) Events() chan Event {
 	return tun.events
 }
 
-func (tun *nativeTun) doRead(buff []byte, offset int) (int, error) {
+func (tun *NativeTun) Read(buff []byte, offset int) (int, error) {
 	select {
 	case err := <-tun.errors:
 		return 0, err
@@ -383,19 +443,7 @@ func (tun *nativeTun) doRead(buff []byte, offset int) (int, error) {
 	}
 }
 
-func (tun *nativeTun) Read(buff []byte, offset int) (int, error) {
-	for {
-		n, err := tun.doRead(buff, offset)
-		if err == nil || !rwcancel.RetryAfterError(err) {
-			return n, err
-		}
-		if !tun.rwcancel.ReadyRead() {
-			return 0, errors.New("tun device closed")
-		}
-	}
-}
-
-func (tun *nativeTun) Write(buff []byte, offset int) (int, error) {
+func (tun *NativeTun) Write(buff []byte, offset int) (int, error) {
 
 	// reserve space for header
 
@@ -418,14 +466,18 @@ func (tun *nativeTun) Write(buff []byte, offset int) (int, error) {
 	return tun.tunFile.Write(buff)
 }
 
-func (tun *nativeTun) Close() error {
-	var err4 error
-	err1 := tun.rwcancel.Cancel()
-	err2 := tun.tunFile.Close()
-	err3 := tunDestroy(tun.name)
+func (tun *NativeTun) Flush() error {
+	// TODO: can flushing be implemented by buffering and using sendmmsg?
+	return nil
+}
+
+func (tun *NativeTun) Close() error {
+	var err3 error
+	err1 := tun.tunFile.Close()
+	err2 := tunDestroy(tun.name)
 	if tun.routeSocket != -1 {
 		unix.Shutdown(tun.routeSocket, unix.SHUT_RDWR)
-		err4 = unix.Close(tun.routeSocket)
+		err3 = unix.Close(tun.routeSocket)
 		tun.routeSocket = -1
 	} else if tun.events != nil {
 		close(tun.events)
@@ -436,13 +488,10 @@ func (tun *nativeTun) Close() error {
 	if err2 != nil {
 		return err2
 	}
-	if err3 != nil {
-		return err3
-	}
-	return err4
+	return err3
 }
 
-func (tun *nativeTun) setMTU(n int) error {
+func (tun *NativeTun) setMTU(n int) error {
 	// open datagram socket
 
 	var fd int
@@ -479,7 +528,7 @@ func (tun *nativeTun) setMTU(n int) error {
 	return nil
 }
 
-func (tun *nativeTun) MTU() (int, error) {
+func (tun *NativeTun) MTU() (int, error) {
 	// open datagram socket
 
 	fd, err := unix.Socket(
