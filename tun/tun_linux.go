@@ -1,6 +1,6 @@
-/* SPDX-License-Identifier: GPL-2.0
+/* SPDX-License-Identifier: MIT
  *
- * Copyright (C) 2017-2018 WireGuard LLC. All Rights Reserved.
+ * Copyright (C) 2017-2019 WireGuard LLC. All Rights Reserved.
  */
 
 package tun
@@ -12,15 +12,16 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"git.zx2c4.com/wireguard-go/rwcancel"
-	"golang.org/x/net/ipv6"
-	"golang.org/x/sys/unix"
 	"net"
 	"os"
-	"strconv"
 	"sync"
+	"syscall"
 	"time"
 	"unsafe"
+
+	"golang.org/x/net/ipv6"
+	"golang.org/x/sys/unix"
+	"golang.zx2c4.com/wireguard/rwcancel"
 )
 
 const (
@@ -28,38 +29,44 @@ const (
 	ifReqSize       = unix.IFNAMSIZ + 64
 )
 
-type nativeTun struct {
+type NativeTun struct {
 	tunFile                 *os.File
-	fd                      uintptr
-	fdCancel                *rwcancel.RWCancel
-	index                   int32         // if index
-	name                    string        // name of interface
-	errors                  chan error    // async error handling
-	events                  chan TUNEvent // device related events
-	nopi                    bool          // the device was pased IFF_NO_PI
+	index                   int32      // if index
+	name                    string     // name of interface
+	errors                  chan error // async error handling
+	events                  chan Event // device related events
+	nopi                    bool       // the device was passed IFF_NO_PI
 	netlinkSock             int
 	netlinkCancel           *rwcancel.RWCancel
 	hackListenerClosed      sync.Mutex
 	statusListenersShutdown chan struct{}
 }
 
-func (tun *nativeTun) File() *os.File {
+func (tun *NativeTun) File() *os.File {
 	return tun.tunFile
 }
 
-func (tun *nativeTun) routineHackListener() {
+func (tun *NativeTun) routineHackListener() {
 	defer tun.hackListenerClosed.Unlock()
 	/* This is needed for the detection to work across network namespaces
 	 * If you are reading this and know a better method, please get in touch.
 	 */
-	fd := int(tun.fd)
 	for {
-		_, err := unix.Write(fd, nil)
+		sysconn, err := tun.tunFile.SyscallConn()
+		if err != nil {
+			return
+		}
+		err2 := sysconn.Control(func(fd uintptr) {
+			_, err = unix.Write(int(fd), nil)
+		})
+		if err2 != nil {
+			return
+		}
 		switch err {
 		case unix.EINVAL:
-			tun.events <- TUNEventUp
+			tun.events <- EventUp
 		case unix.EIO:
-			tun.events <- TUNEventDown
+			tun.events <- EventDown
 		default:
 			return
 		}
@@ -87,7 +94,7 @@ func createNetlinkSocket() (int, error) {
 	return sock, nil
 }
 
-func (tun *nativeTun) routineNetlinkListener() {
+func (tun *NativeTun) routineNetlinkListener() {
 	defer func() {
 		unix.Close(tun.netlinkSock)
 		tun.hackListenerClosed.Lock()
@@ -141,14 +148,14 @@ func (tun *nativeTun) routineNetlinkListener() {
 				}
 
 				if info.Flags&unix.IFF_RUNNING != 0 {
-					tun.events <- TUNEventUp
+					tun.events <- EventUp
 				}
 
 				if info.Flags&unix.IFF_RUNNING == 0 {
-					tun.events <- TUNEventDown
+					tun.events <- EventDown
 				}
 
-				tun.events <- TUNEventMTUUpdate
+				tun.events <- EventMTUUpdate
 
 			default:
 				remain = remain[hdr.Len:]
@@ -157,21 +164,17 @@ func (tun *nativeTun) routineNetlinkListener() {
 	}
 }
 
-func (tun *nativeTun) isUp() (bool, error) {
+func (tun *NativeTun) isUp() (bool, error) {
 	inter, err := net.InterfaceByName(tun.name)
 	return inter.Flags&net.FlagUp != 0, err
 }
 
-func getDummySock() (int, error) {
-	return unix.Socket(
+func getIFIndex(name string) (int32, error) {
+	fd, err := unix.Socket(
 		unix.AF_INET,
 		unix.SOCK_DGRAM,
 		0,
 	)
-}
-
-func getIFIndex(name string) (int32, error) {
-	fd, err := getDummySock()
 	if err != nil {
 		return 0, err
 	}
@@ -194,10 +197,8 @@ func getIFIndex(name string) (int32, error) {
 	return *(*int32)(unsafe.Pointer(&ifr[unix.IFNAMSIZ])), nil
 }
 
-func (tun *nativeTun) setMTU(n int) error {
-
+func (tun *NativeTun) setMTU(n int) error {
 	// open datagram socket
-
 	fd, err := unix.Socket(
 		unix.AF_INET,
 		unix.SOCK_DGRAM,
@@ -229,10 +230,8 @@ func (tun *nativeTun) setMTU(n int) error {
 	return nil
 }
 
-func (tun *nativeTun) MTU() (int, error) {
-
+func (tun *NativeTun) MTU() (int, error) {
 	// open datagram socket
-
 	fd, err := unix.Socket(
 		unix.AF_INET,
 		unix.SOCK_DGRAM,
@@ -256,23 +255,32 @@ func (tun *nativeTun) MTU() (int, error) {
 		uintptr(unsafe.Pointer(&ifr[0])),
 	)
 	if errno != 0 {
-		return 0, errors.New("failed to get MTU of TUN device: " + strconv.FormatInt(int64(errno), 10))
+		return 0, errors.New("failed to get MTU of TUN device: " + errno.Error())
 	}
 
 	return int(*(*int32)(unsafe.Pointer(&ifr[unix.IFNAMSIZ]))), nil
 }
 
-func (tun *nativeTun) Name() (string, error) {
-
+func (tun *NativeTun) Name() (string, error) {
+	sysconn, err := tun.tunFile.SyscallConn()
+	if err != nil {
+		return "", err
+	}
 	var ifr [ifReqSize]byte
-	_, _, errno := unix.Syscall(
-		unix.SYS_IOCTL,
-		tun.fd,
-		uintptr(unix.TUNGETIFF),
-		uintptr(unsafe.Pointer(&ifr[0])),
-	)
+	var errno syscall.Errno
+	err = sysconn.Control(func(fd uintptr) {
+		_, _, errno = unix.Syscall(
+			unix.SYS_IOCTL,
+			fd,
+			uintptr(unix.TUNGETIFF),
+			uintptr(unsafe.Pointer(&ifr[0])),
+		)
+	})
+	if err != nil {
+		return "", errors.New("failed to get name of TUN device: " + err.Error())
+	}
 	if errno != 0 {
-		return "", errors.New("failed to get name of TUN device: " + strconv.FormatInt(int64(errno), 10))
+		return "", errors.New("failed to get name of TUN device: " + errno.Error())
 	}
 	nullStr := ifr[:]
 	i := bytes.IndexByte(nullStr, 0)
@@ -283,7 +291,7 @@ func (tun *nativeTun) Name() (string, error) {
 	return tun.name, nil
 }
 
-func (tun *nativeTun) Write(buff []byte, offset int) (int, error) {
+func (tun *NativeTun) Write(buff []byte, offset int) (int, error) {
 
 	if tun.nopi {
 		buff = buff[offset:]
@@ -311,7 +319,12 @@ func (tun *nativeTun) Write(buff []byte, offset int) (int, error) {
 	return tun.tunFile.Write(buff)
 }
 
-func (tun *nativeTun) doRead(buff []byte, offset int) (int, error) {
+func (tun *NativeTun) Flush() error {
+	// TODO: can flushing be implemented by buffering and using sendmmsg?
+	return nil
+}
+
+func (tun *NativeTun) Read(buff []byte, offset int) (int, error) {
 	select {
 	case err := <-tun.errors:
 		return 0, err
@@ -329,23 +342,11 @@ func (tun *nativeTun) doRead(buff []byte, offset int) (int, error) {
 	}
 }
 
-func (tun *nativeTun) Read(buff []byte, offset int) (int, error) {
-	for {
-		n, err := tun.doRead(buff, offset)
-		if err == nil || !rwcancel.RetryAfterError(err) {
-			return n, err
-		}
-		if !tun.fdCancel.ReadyRead() {
-			return 0, errors.New("tun device closed")
-		}
-	}
-}
-
-func (tun *nativeTun) Events() chan TUNEvent {
+func (tun *NativeTun) Events() chan Event {
 	return tun.events
 }
 
-func (tun *nativeTun) Close() error {
+func (tun *NativeTun) Close() error {
 	var err1 error
 	if tun.statusListenersShutdown != nil {
 		close(tun.statusListenersShutdown)
@@ -356,39 +357,18 @@ func (tun *nativeTun) Close() error {
 		close(tun.events)
 	}
 	err2 := tun.tunFile.Close()
-	err3 := tun.fdCancel.Cancel()
 
 	if err1 != nil {
 		return err1
 	}
-	if err2 != nil {
-		return err2
-	}
-	return err3
+	return err2
 }
 
-func CreateTUN(name string, mtu int) (TUNDevice, error) {
-
-	// open clone device
-
-	// HACK: we open it as a raw Fd first, so that f.nonblock=false
-	// when we make it into a file object.
+func CreateTUN(name string, mtu int) (Device, error) {
 	nfd, err := unix.Open(cloneDevicePath, os.O_RDWR, 0)
 	if err != nil {
 		return nil, err
 	}
-
-	err = unix.SetNonblock(nfd, true)
-	if err != nil {
-		return nil, err
-	}
-
-	fd := os.NewFile(uintptr(nfd), cloneDevicePath)
-	if err != nil {
-		return nil, err
-	}
-
-	// create new device
 
 	var ifr [ifReqSize]byte
 	var flags uint16 = unix.IFF_TUN // | unix.IFF_NO_PI (disabled for TUN status hack)
@@ -401,37 +381,37 @@ func CreateTUN(name string, mtu int) (TUNDevice, error) {
 
 	_, _, errno := unix.Syscall(
 		unix.SYS_IOCTL,
-		fd.Fd(),
+		uintptr(nfd),
 		uintptr(unix.TUNSETIFF),
 		uintptr(unsafe.Pointer(&ifr[0])),
 	)
 	if errno != 0 {
 		return nil, errno
 	}
+	err = unix.SetNonblock(nfd, true)
+
+	// Note that the above -- open,ioctl,nonblock -- must happen prior to handing it to netpoll as below this line.
+
+	fd := os.NewFile(uintptr(nfd), cloneDevicePath)
+	if err != nil {
+		return nil, err
+	}
 
 	return CreateTUNFromFile(fd, mtu)
 }
 
-func CreateTUNFromFile(file *os.File, mtu int) (TUNDevice, error) {
-	tun := &nativeTun{
+func CreateTUNFromFile(file *os.File, mtu int) (Device, error) {
+	tun := &NativeTun{
 		tunFile:                 file,
-		fd:                      file.Fd(),
-		events:                  make(chan TUNEvent, 5),
+		events:                  make(chan Event, 5),
 		errors:                  make(chan error, 5),
 		statusListenersShutdown: make(chan struct{}),
 		nopi:                    false,
 	}
 	var err error
 
-	tun.fdCancel, err = rwcancel.NewRWCancel(int(tun.fd))
-	if err != nil {
-		tun.tunFile.Close()
-		return nil, err
-	}
-
 	_, err = tun.Name()
 	if err != nil {
-		tun.tunFile.Close()
 		return nil, err
 	}
 
@@ -444,12 +424,11 @@ func CreateTUNFromFile(file *os.File, mtu int) (TUNDevice, error) {
 
 	tun.netlinkSock, err = createNetlinkSocket()
 	if err != nil {
-		tun.tunFile.Close()
 		return nil, err
 	}
 	tun.netlinkCancel, err = rwcancel.NewRWCancel(tun.netlinkSock)
 	if err != nil {
-		tun.tunFile.Close()
+		unix.Close(tun.netlinkSock)
 		return nil, err
 	}
 
@@ -459,9 +438,28 @@ func CreateTUNFromFile(file *os.File, mtu int) (TUNDevice, error) {
 
 	err = tun.setMTU(mtu)
 	if err != nil {
-		tun.Close()
+		unix.Close(tun.netlinkSock)
 		return nil, err
 	}
 
 	return tun, nil
+}
+
+func CreateUnmonitoredTUNFromFD(fd int) (Device, string, error) {
+	err := unix.SetNonblock(fd, true)
+	if err != nil {
+		return nil, "", err
+	}
+	file := os.NewFile(uintptr(fd), "/dev/tun")
+	tun := &NativeTun{
+		tunFile: file,
+		events:  make(chan Event, 5),
+		errors:  make(chan error, 5),
+		nopi:    true,
+	}
+	name, err := tun.Name()
+	if err != nil {
+		return nil, "", err
+	}
+	return tun, name, nil
 }

@@ -2,8 +2,6 @@
 
 This is an implementation of WireGuard in Go.
 
-***WARNING:*** This is a work in progress and not ready for prime time, with no official "releases" yet. It is extremely rough around the edges and leaves much to be desired. There are bugs and we are not yet in a position to make claims about its security. Beware.
-
 ## Usage
 
 Most Linux kernel WireGuard users are used to adding an interface with `ip link add wg0 type wireguard`. With wireguard-go, instead simply run:
@@ -20,7 +18,7 @@ To run wireguard-go without forking to the background, pass `-f` or `--foregroun
 $ wireguard-go -f wg0
 ```
 
-When an interface is running, you may use [`wg(8)`](https://git.zx2c4.com/WireGuard/about/src/tools/man/wg.8) to configure it, as well as the usual `ip(8)` and `ifconfig(8)` commands.
+When an interface is running, you may use [`wg(8)`](https://git.zx2c4.com/wireguard-tools/about/src/man/wg.8) to configure it, as well as the usual `ip(8)` and `ifconfig(8)` commands.
 
 To run with more logging you may set the environment variable `LOG_LEVEL=debug`.
 
@@ -36,7 +34,7 @@ This runs on macOS using the utun driver. It does not yet support sticky sockets
 
 ### Windows
 
-It is currently a work in progress to strip out the beginnings of an experiment done with the OpenVPN tuntap driver and instead port to the new UWP APIs for tunnels. In other words, this does not *yet* work on Windows.
+This runs on Windows, but you should instead use it from the more [fully featured Windows app](https://git.zx2c4.com/wireguard-windows/about/), which uses this as a module.
 
 ### FreeBSD
 
@@ -48,7 +46,7 @@ This will run on OpenBSD. It does not yet support sticky sockets. Fwmark is mapp
 
 ## Building
 
-This requires an installation of [go](https://golang.org) ≥ 1.11.
+This requires an installation of [go](https://golang.org) ≥ 1.12.
 
 ```
 $ git clone https://git.zx2c4.com/wireguard-go
@@ -58,27 +56,22 @@ $ make
 
 ## License
 
-    This program is free software; you can redistribute it and/or modify
-    it under the terms of the GNU General Public License version 2 as
-    published by the Free Software Foundation.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
-
-    You should have received a copy of the GNU General Public License along
-    with this program; if not, write to the Free Software Foundation, Inc.,
-    51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
-
-    ---------------------------------------------------------------------------
-    Additional Permissions For Submission to Apple App Store: Provided that you
-    are otherwise in compliance with the GPLv2 for each covered work you convey
-    (including without limitation making the Corresponding Source available in
-    compliance with Section 3 of the GPLv2), you are granted the additional
-    permission to convey through the Apple App Store non-source executable
-    versions of the Program as incorporated into each applicable covered work
-    as Executable Versions only under the Mozilla Public License version 2.0
-    (https://www.mozilla.org/en-US/MPL/2.0/).
+    Copyright (C) 2017-2019 WireGuard LLC. All Rights Reserved.
     
-
+    Permission is hereby granted, free of charge, to any person obtaining a copy of
+    this software and associated documentation files (the "Software"), to deal in
+    the Software without restriction, including without limitation the rights to
+    use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+    of the Software, and to permit persons to whom the Software is furnished to do
+    so, subject to the following conditions:
+    
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+    
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.

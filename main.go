@@ -1,18 +1,23 @@
-/* SPDX-License-Identifier: GPL-2.0
+// +build !windows
+
+/* SPDX-License-Identifier: MIT
  *
- * Copyright (C) 2017-2018 WireGuard LLC. All Rights Reserved.
+ * Copyright (C) 2017-2019 WireGuard LLC. All Rights Reserved.
  */
 
 package main
 
 import (
 	"fmt"
-	"git.zx2c4.com/wireguard-go/tun"
 	"os"
 	"os/signal"
 	"runtime"
 	"strconv"
 	"syscall"
+
+	"golang.zx2c4.com/wireguard/device"
+	"golang.zx2c4.com/wireguard/ipc"
+	"golang.zx2c4.com/wireguard/tun"
 )
 
 const (
@@ -32,55 +37,31 @@ func printUsage() {
 }
 
 func warning() {
-	if os.Getenv(ENV_WG_PROCESS_FOREGROUND) == "1" {
+	if runtime.GOOS != "linux" || os.Getenv(ENV_WG_PROCESS_FOREGROUND) == "1" {
 		return
 	}
 
-	shouldQuit := false
-
 	fmt.Fprintln(os.Stderr, "WARNING WARNING WARNING WARNING WARNING WARNING WARNING")
 	fmt.Fprintln(os.Stderr, "W                                                     G")
-	fmt.Fprintln(os.Stderr, "W   This is alpha software. It will very likely not   G")
-	fmt.Fprintln(os.Stderr, "W   do what it is supposed to do, and things may go   G")
-	fmt.Fprintln(os.Stderr, "W   horribly wrong. You have been warned. Proceed     G")
-	fmt.Fprintln(os.Stderr, "W   at your own risk.                                 G")
-	if runtime.GOOS == "linux" {
-		shouldQuit = os.Getenv("WG_I_PREFER_BUGGY_USERSPACE_TO_POLISHED_KMOD") != "1"
-
-		fmt.Fprintln(os.Stderr, "W                                                     G")
-		fmt.Fprintln(os.Stderr, "W   Furthermore, you are running this software on a   G")
-		fmt.Fprintln(os.Stderr, "W   Linux kernel, which is probably unnecessary and   G")
-		fmt.Fprintln(os.Stderr, "W   foolish. This is because the Linux kernel has     G")
-		fmt.Fprintln(os.Stderr, "W   built-in first class support for WireGuard, and   G")
-		fmt.Fprintln(os.Stderr, "W   this support is much more refined than this       G")
-		fmt.Fprintln(os.Stderr, "W   program. For more information on installing the   G")
-		fmt.Fprintln(os.Stderr, "W   kernel module, please visit:                      G")
-		fmt.Fprintln(os.Stderr, "W           https://www.wireguard.com/install         G")
-		if shouldQuit {
-			fmt.Fprintln(os.Stderr, "W                                                     G")
-			fmt.Fprintln(os.Stderr, "W   If you still want to use this program, against    G")
-			fmt.Fprintln(os.Stderr, "W   the sage advice here, please first export this    G")
-			fmt.Fprintln(os.Stderr, "W   environment variable:                             G")
-			fmt.Fprintln(os.Stderr, "W   WG_I_PREFER_BUGGY_USERSPACE_TO_POLISHED_KMOD=1    G")
-		}
-	}
+	fmt.Fprintln(os.Stderr, "W   You are running this software on a Linux kernel,  G")
+	fmt.Fprintln(os.Stderr, "W   which is probably unnecessary and misguided. This G")
+	fmt.Fprintln(os.Stderr, "W   is because the Linux kernel has built-in first    G")
+	fmt.Fprintln(os.Stderr, "W   class support for WireGuard, and this support is  G")
+	fmt.Fprintln(os.Stderr, "W   much more refined than this slower userspace      G")
+	fmt.Fprintln(os.Stderr, "W   implementation. For more information on           G")
+	fmt.Fprintln(os.Stderr, "W   installing the kernel module, please visit:       G")
+	fmt.Fprintln(os.Stderr, "W           https://www.wireguard.com/install         G")
 	fmt.Fprintln(os.Stderr, "W                                                     G")
 	fmt.Fprintln(os.Stderr, "WARNING WARNING WARNING WARNING WARNING WARNING WARNING")
-
-	if shouldQuit {
-		os.Exit(1)
-	}
 }
 
 func main() {
 	if len(os.Args) == 2 && os.Args[1] == "--version" {
-		fmt.Printf("wireguard-go v%s\n\nUserspace WireGuard daemon for %s-%s.\nInformation available at https://www.wireguard.com.\nCopyright (C) Jason A. Donenfeld <Jason@zx2c4.com>.\n", WireGuardGoVersion, runtime.GOOS, runtime.GOARCH)
+		fmt.Printf("wireguard-go v%s\n\nUserspace WireGuard daemon for %s-%s.\nInformation available at https://www.wireguard.com.\nCopyright (C) Jason A. Donenfeld <Jason@zx2c4.com>.\n", device.WireGuardGoVersion, runtime.GOOS, runtime.GOARCH)
 		return
 	}
 
 	warning()
-
-	// parse arguments
 
 	var foreground bool
 	var interfaceName string
@@ -117,23 +98,23 @@ func main() {
 	logLevel := func() int {
 		switch os.Getenv("LOG_LEVEL") {
 		case "debug":
-			return LogLevelDebug
+			return device.LogLevelDebug
 		case "info":
-			return LogLevelInfo
+			return device.LogLevelInfo
 		case "error":
-			return LogLevelError
+			return device.LogLevelError
 		case "silent":
-			return LogLevelSilent
+			return device.LogLevelSilent
 		}
-		return LogLevelInfo
+		return device.LogLevelInfo
 	}()
 
 	// open TUN device (or use supplied fd)
 
-	tun, err := func() (tun.TUNDevice, error) {
+	tun, err := func() (tun.Device, error) {
 		tunFdStr := os.Getenv(ENV_WG_TUN_FD)
 		if tunFdStr == "" {
-			return tun.CreateTUN(interfaceName, DefaultMTU)
+			return tun.CreateTUN(interfaceName, device.DefaultMTU)
 		}
 
 		// construct tun device from supplied fd
@@ -143,8 +124,13 @@ func main() {
 			return nil, err
 		}
 
+		err = syscall.SetNonblock(int(fd), true)
+		if err != nil {
+			return nil, err
+		}
+
 		file := os.NewFile(uintptr(fd), "")
-		return tun.CreateTUNFromFile(file, DefaultMTU)
+		return tun.CreateTUNFromFile(file, device.DefaultMTU)
 	}()
 
 	if err == nil {
@@ -154,12 +140,12 @@ func main() {
 		}
 	}
 
-	logger := NewLogger(
+	logger := device.NewLogger(
 		logLevel,
 		fmt.Sprintf("(%s) ", interfaceName),
 	)
 
-	logger.Info.Println("Starting wireguard-go version", WireGuardGoVersion)
+	logger.Info.Println("Starting wireguard-go version", device.WireGuardGoVersion)
 
 	logger.Debug.Println("Debug log enabled")
 
@@ -173,7 +159,7 @@ func main() {
 	fileUAPI, err := func() (*os.File, error) {
 		uapiFdStr := os.Getenv(ENV_WG_UAPI_FD)
 		if uapiFdStr == "" {
-			return UAPIOpen(interfaceName)
+			return ipc.UAPIOpen(interfaceName)
 		}
 
 		// use supplied fd
@@ -199,7 +185,7 @@ func main() {
 		env = append(env, fmt.Sprintf("%s=4", ENV_WG_UAPI_FD))
 		env = append(env, fmt.Sprintf("%s=1", ENV_WG_PROCESS_FOREGROUND))
 		files := [3]*os.File{}
-		if os.Getenv("LOG_LEVEL") != "" && logLevel != LogLevelSilent {
+		if os.Getenv("LOG_LEVEL") != "" && logLevel != device.LogLevelSilent {
 			files[0], _ = os.Open(os.DevNull)
 			files[1] = os.Stdout
 			files[2] = os.Stderr
@@ -239,14 +225,14 @@ func main() {
 		return
 	}
 
-	device := NewDevice(tun, logger)
+	device := device.NewDevice(tun, logger)
 
 	logger.Info.Println("Device started")
 
 	errs := make(chan error)
 	term := make(chan os.Signal, 1)
 
-	uapi, err := UAPIListen(interfaceName, fileUAPI)
+	uapi, err := ipc.UAPIListen(interfaceName, fileUAPI)
 	if err != nil {
 		logger.Error.Println("Failed to listen on uapi socket:", err)
 		os.Exit(ExitSetupFailed)
@@ -259,7 +245,7 @@ func main() {
 				errs <- err
 				return
 			}
-			go ipcHandle(device, conn)
+			go device.IpcHandle(conn)
 		}
 	}()
 
